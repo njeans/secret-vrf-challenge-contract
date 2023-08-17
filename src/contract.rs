@@ -1,5 +1,5 @@
 use std::collections::HashMap;
-use cosmwasm_std::{entry_point, Binary, Deps, DepsMut, Env, MessageInfo, Response, StdResult, Coin, Uint128, StdError, BankMsg, Event, CosmosMsg, Addr};
+use cosmwasm_std::{ensure, entry_point, Binary, Deps, DepsMut, Env, MessageInfo, Response, StdResult, Coin, Uint128, StdError, BankMsg, Event, CosmosMsg, Addr, to_binary, from_binary};
 use rand_core::RngCore;
 
 use aes_gcm::{
@@ -7,6 +7,7 @@ use aes_gcm::{
     Aes256Gcm, Nonce, Key // Or `Aes128Gcm`
 };
 use generic_array::GenericArray;
+use sha2::{Sha256, Digest};
 
 use crate::msg::{ExecuteMsg, InstantiateMsg, QueryMsg};
 use crate::rng::Prng;
@@ -14,9 +15,10 @@ use crate::state::{Config, load_admin, load_config, save_admin, save_config};
 use crate::types::{Bet, CornerType, GameResult, LineType};
 
 
-use crate::state::{State, CheckPoint, Request, RequestType};
+use crate::state::{State, CheckPoint, Request, RequestType, ResponseState};
 use crate::state::{CHECKPOINT_KEY, PREFIX_REQUESTS_KEY, CONFIG_KEY2, REQUEST_SEQNO_KEY, AEAD_KEY, REQUEST_LEN_KEY};
 use secret_toolkit_crypto::ContractPrng;
+use secret_toolkit::viewing_key::{ViewingKey, ViewingKeyStore};
 
 #[entry_point]
 pub fn instantiate(
@@ -134,20 +136,24 @@ pub fn execute(
             ),
 
             ExecuteMsg::CommitResponse {
-                cipher
+                cipher,
+                nonce
             } => try_commit_response(
                     deps,
                     env,
                     info,
-                    cipher
+                    cipher,
+                    nonce
                 ),
             ExecuteMsg::WriteCheckpoint {
-                cipher
+                cipher,
+                nonce
             } => try_write_checkpoint(
                     deps,
                     env,
                     info,
-                    cipher
+                    cipher,
+                    nonce
             ),
             ExecuteMsg::CreateViewingKey { 
                 entropy
@@ -328,12 +334,13 @@ fn try_commit_response(
     _env: Env,
     _info: MessageInfo,
     cipher: Binary,
+    nonce: [u8; 12]
 ) -> StdResult<Response> {
 
     let seqno = REQUEST_SEQNO_KEY.load(deps.storage).unwrap();
     let req_len = REQUEST_LEN_KEY.load(deps.storage).unwrap();
 
-    let response = ResponseState::decrypt_response(deps.storage, cipher).unwrap();
+    let response = ResponseState::decrypt_response(deps.storage, cipher, &nonce).unwrap();
     // println!("try_commit_response seqno {:?} req_seqno {:?}", response.seqno, seqno);
     if  response.seqno != seqno {
         return Err(StdError::generic_err("Response should processes strictly in order"));
@@ -370,8 +377,9 @@ fn try_write_checkpoint(
     _env: Env,
     _info: MessageInfo,
     cipher: Binary,
+    nonce: [u8; 12],
 ) -> StdResult<Response> {
-    let new_checkpoint: CheckPoint = CheckPoint::decrypt_checkpoint(deps.storage, cipher).unwrap();
+    let new_checkpoint: CheckPoint = CheckPoint::decrypt_checkpoint(deps.storage, cipher, &nonce).unwrap();
     let old_checkpoint: CheckPoint = CheckPoint::load(deps.storage).unwrap();
 
     if old_checkpoint.seqno > new_checkpoint.seqno {
@@ -406,7 +414,45 @@ pub fn try_set_key(deps: DepsMut, info: MessageInfo, key: String) -> StdResult<R
     Ok(Response::default())
 }
 
+fn gen_hash(counter_in: Uint128, current_hash: Binary) -> StdResult<Binary> {
+    // Create sha256 hasher
+    let mut hasher = Sha256::default();
+    // Counter value as little endian bytes, wasm is little so should be no overhead
+    let counter_as_bytes = counter_in.to_le_bytes();
 
+    // update hasher with counter bytes
+    hasher.update(counter_as_bytes.as_slice());
+    // update hasher with the passed in current hash
+    hasher.update(current_hash.as_slice());
+
+    // finalize hash
+    let finalized_hash = hasher.finalize();
+    // convert finalized hash to byte slice
+    let hash_digest = finalized_hash.as_slice();
+    // return b64 blob of the hash_digest
+    Ok(Binary::from(hash_digest))
+}
+
+/// Takes in a key and a data_blob. Returns a MAC produced via H(key || data_blob).
+fn gen_mac(key: Binary, data_blob: Binary) -> StdResult<Binary> {
+    // in theory we've already instantiated the contract so this cannot fail...
+    // Create sha256 hasher
+    let mut hasher = Sha256::default();
+
+    // update hasher state with key
+    hasher.update(key.as_slice());
+    // update hasher state with data_blob
+    hasher.update(data_blob.as_slice());
+
+    // finalize hash
+    let finalized_hash = hasher.finalize();
+    // produce hash_digest
+    let hash_digest = finalized_hash.as_slice();
+    // convert from slice of u8s to b64
+    let hash_as_b64 = Binary::from(hash_digest);
+    // return the the counter,
+    Ok(hash_as_b64)
+}
 
 fn corner_result(winner: u32, corner: CornerType) -> GameResult {
     match corner {

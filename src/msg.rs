@@ -1,4 +1,4 @@
-use cosmwasm_std::{Addr, Coin, Uint128};
+use cosmwasm_std::{Addr, Coin, Uint128, to_binary, from_binary, Binary};
 use schemars::JsonSchema;
 use serde::{Deserialize, Serialize};
 use crate::types::Bet;
@@ -36,11 +36,13 @@ pub enum ExecuteMsg {
     },
 
     CommitResponse {
-        cipher: Binary
+        cipher: Binary,
+        nonce: [u8; 12]       
     },
 
     WriteCheckpoint {
-        cipher: Binary       
+        cipher: Binary,
+        nonce: [u8; 12]       
     },
 
     CreateViewingKey {
