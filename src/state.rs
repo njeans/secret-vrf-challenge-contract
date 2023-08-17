@@ -3,11 +3,6 @@ use secret_toolkit_storage::Item;
 use cosmwasm_std::{Addr, Binary, Uint128, Env, StdResult, Storage, StdError, to_binary, from_binary};
 use serde::{Deserialize, Serialize};
 
-use aes_gcm::{
-    aead::{Aead, AeadCore, KeyInit},
-    Aes256Gcm, Nonce, Key // Or `Aes128Gcm`
-};
-
 /// Basic configuration struct
 pub static CONFIG_KEY2: Item<State> = Item::new(b"config");
 
@@ -92,26 +87,6 @@ impl CheckPoint {
 
     pub fn save(store: &mut dyn Storage, checkpoint: CheckPoint) -> StdResult<()> {
         CHECKPOINT_KEY.save(store, &checkpoint)
-    }
-
-    pub fn decrypt_checkpoint(store: &dyn Storage, cipher: Binary) -> StdResult<CheckPoint> {
-        // println!("decrypting cipher {:?}", cipher);
-        let key = AEAD_KEY.load(store).unwrap();
-        let symmetric_key: &Key<Aes256Gcm> = key.into();
-        let cipher = Aes256Gcm::new(&symmetric_key);
-
-        let checkpoint_vec = cipher.decrypt(&nonce, ciphertext.as_ref()).unwrap();
-        let checkpoint_slice = checkpoint_vec.as_slice();
-
-        // let cipher_vec: Vec<u8> = from_binary(&cipher).unwrap();
-        // let cipher_slice: &[u8] = cipher_vec.as_slice();
-        // // println!("decrypting cipher_vec {:?}", cipher_slice);
-        // let checkpoint_slice = decrypt(cipher_slice, &key).unwrap();
-        // println!("decrypted checkpoint_vec {:?}", checkpoint_slice);
-        let checkpoint_bin = Binary::from(checkpoint_slice);
-        // println!("decrypted checkpoint_bin {:?}", checkpoint_bin);
-        let checkpoint: CheckPoint = from_binary(&checkpoint_bin).unwrap();
-        return Ok(checkpoint);
     }
 
 }

@@ -41,7 +41,7 @@ const setup = async () => {
   //   tx.arrayLog.find((log) => log.type === "message" && log.key === "code_id")
   //     .value
   // );
-  const codeId = 5;
+  const codeId = 1;
   console.log("codeId: ", codeId);
 
   // contract hash, useful for contract composition

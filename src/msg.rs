@@ -29,29 +29,6 @@ pub enum ExecuteMsg {
         amount: Uint128
     },
 
-    ApplyUpdate {
-        new_counter: Uint128,
-        new_hash: Binary,
-        current_mac: Binary
-    },
-
-    CommitResponse {
-        cipher: Binary
-    },
-
-    WriteCheckpoint {
-        cipher: Binary       
-    },
-
-    CreateViewingKey {
-        entropy: String
-    },
-
-    SetViewingKey {
-        key: String
-    },
-
-
     Bet {
         bets: Vec<Bet>
     },
