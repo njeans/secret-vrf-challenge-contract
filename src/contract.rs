@@ -1,35 +1,87 @@
 use std::collections::HashMap;
-use cosmwasm_std::{entry_point, Binary, Deps, DepsMut, Env, MessageInfo, Response, StdResult, Coin, Uint128, StdError, BankMsg, Event, CosmosMsg};
+use cosmwasm_std::{entry_point, Binary, Deps, DepsMut, Env, MessageInfo, Response, StdResult, Coin, Uint128, StdError, BankMsg, Event, CosmosMsg, Addr};
 use rand_core::RngCore;
 
+use aes_gcm::{
+    aead::{Aead, AeadCore, KeyInit},
+    Aes256Gcm, Nonce, Key // Or `Aes128Gcm`
+};
+use generic_array::GenericArray;
 
 use crate::msg::{ExecuteMsg, InstantiateMsg, QueryMsg};
 use crate::rng::Prng;
 use crate::state::{Config, load_admin, load_config, save_admin, save_config};
 use crate::types::{Bet, CornerType, GameResult, LineType};
 
+
+use crate::state::{State, CheckPoint, Request, RequestType};
+use crate::state::{CHECKPOINT_KEY, PREFIX_REQUESTS_KEY, CONFIG_KEY2, REQUEST_SEQNO_KEY, AEAD_KEY, REQUEST_LEN_KEY};
+use secret_toolkit_crypto::ContractPrng;
+
 #[entry_point]
 pub fn instantiate(
     deps: DepsMut,
-    _env: Env,
+    env: Env,
     info: MessageInfo,
     msg: InstantiateMsg,
 ) -> StdResult<Response> {
 
-    // save init params to state
-    save_config(deps.storage, &crate::state::Config {
-        min_bet: msg.min_bet.unwrap_or(0),
-        max_bet: msg.max_bet.unwrap_or(u64::MAX),
-        max_total: msg.max_total.unwrap_or(u64::MAX),
-        supported_denoms: msg.supported_denoms.unwrap_or(vec!["uscrt".to_string()]),
-    })?;
+    // grab random entropy that is produced by the consensus
+    let entropy = env.block.random.as_ref().unwrap();
 
-    if let Some(admin) = msg.admin {
-        save_admin(deps.storage, &admin)?
-    } else {
-        save_admin(deps.storage, &info.sender)?
-    }
+    // The `State` is created
+    let config = State {
+        owner: info.sender,
+        key: entropy.clone(),
+        current_hash: entropy.clone(),
+        counter: Uint128::zero()
+    };
 
+    let zero_val = Uint128::zero();
+
+    let checkpoint = CheckPoint {
+        checkpoint: Vec::new(),
+        seqno: zero_val,
+        resp_seqno: zero_val
+    };
+
+
+
+    let seed: [u8;16] = [1,1,1,1,1,1,1,1,1,1,1,1,1,1,1,1];
+    let mut prng = ContractPrng::new(&seed, entropy.as_slice());
+
+    let key: &[u8; 32] = &prng.rand_bytes();
+    let symmetric_key: &Key<Aes256Gcm> = key.into();
+    let rnd_bytes = prng.rand_bytes();
+    let nonce: [u8; 12] = rnd_bytes[0..12].try_into().unwrap();
+    let nonce = GenericArray::from_slice(&nonce);
+
+    let cipher = Aes256Gcm::new(&symmetric_key);
+    let ciphertext = cipher.encrypt(&nonce, b"plaintext message".as_ref()).unwrap();
+    let plaintext = cipher.decrypt(&nonce, ciphertext.as_ref()).unwrap();
+    assert_eq!(&plaintext, b"plaintext message");
+
+
+
+    // let mut buffer: Vec<u8, 128> = Vec::new(); // Note: buffer needs 16-bytes overhead for auth tag
+    // buffer.extend_from_slice(b"plaintext message");
+    
+    // let cipher = Aes256Gcm::new(key);
+    // cipher.encrypt_in_place(&nonce, b"", &mut buffer)?;
+    // // `buffer` now contains the message ciphertext
+    // assert_ne!(&buffer, b"plaintext message");
+
+    // // Decrypt `buffer` in-place, replacing its ciphertext context with the original plaintext
+    // cipher.decrypt_in_place(&nonce, b"", &mut buffer).unwrap();
+    // assert_eq!(&buffer, b"plaintext message");
+
+    // Save data to storage
+    CONFIG_KEY2.save(deps.storage, &config).unwrap();
+    REQUEST_SEQNO_KEY.save(deps.storage, &zero_val).unwrap();
+    REQUEST_LEN_KEY.save(deps.storage, &zero_val).unwrap();
+    CHECKPOINT_KEY.save(deps.storage, &checkpoint).unwrap();
+    AEAD_KEY.save(deps.storage, key).unwrap();
+    
     Ok(Response::default())
 }
 
@@ -42,6 +94,78 @@ pub fn execute(
 ) -> Result<Response, StdError> {
 
     match msg {
+        ExecuteMsg::SubmitDeposit {
+        } => try_submit_deposit(
+                deps,
+                env,
+                info,
+            ),
+        ExecuteMsg::SubmitTransfer {
+            to,
+            amount,
+            memo
+        } => try_submit_transfer(
+                deps,
+                env,
+                info,
+                to,
+                amount,
+                memo
+            ),
+        ExecuteMsg::SubmitWithdraw {
+            amount
+        } => try_submit_withdraw(
+                deps,
+                env,
+                info,
+                amount
+            ),
+        ExecuteMsg::ApplyUpdate {
+            new_counter,
+            new_hash,
+            current_mac,
+        } => try_apply_update(
+                deps,
+                env,
+                info,
+                new_counter,
+                new_hash,
+                current_mac,
+            ),
+
+            ExecuteMsg::CommitResponse {
+                cipher
+            } => try_commit_response(
+                    deps,
+                    env,
+                    info,
+                    cipher
+                ),
+            ExecuteMsg::WriteCheckpoint {
+                cipher
+            } => try_write_checkpoint(
+                    deps,
+                    env,
+                    info,
+                    cipher
+            ),
+            ExecuteMsg::CreateViewingKey { 
+                entropy
+            } => try_create_key(
+                deps, 
+                env, 
+                info, 
+                entropy
+            ),
+            ExecuteMsg::SetViewingKey { 
+                key
+            } => try_set_key(
+                deps, 
+                info, 
+                key
+            ),
+
+
         ExecuteMsg::Bet { bets } =>
             handle_game_result(deps, env, info, bets),
         ExecuteMsg::AdminWithdraw { coin } => {
@@ -70,6 +194,218 @@ pub fn execute(
         }
     }
 }
+
+fn try_submit_deposit(
+    deps: DepsMut,
+    _env: Env,
+    info: MessageInfo,
+) -> StdResult<Response> {
+
+    let mut amount = Uint128::zero();
+
+    for coin in &info.funds {
+        amount += coin.amount
+    }
+
+    if amount.is_zero() {
+        return Err(StdError::generic_err("No funds were sent to be deposited"));
+    }
+
+    let request = Request {
+        reqtype: RequestType::DEPOSIT,
+        from: info.sender,
+        to: None,
+        amount: amount,
+        memo: None
+    };
+    let req_len = REQUEST_LEN_KEY.load(deps.storage).unwrap();
+    let new_len = req_len.checked_add(Uint128::one()).unwrap();
+    REQUEST_LEN_KEY.save(deps.storage, &new_len).unwrap();
+    println!("try_submit_deposit save at seqno {:?}", req_len);
+    Request::save(deps.storage, request, req_len).unwrap();
+    //TODO add event
+    Ok(Response::default())
+}
+
+fn try_submit_transfer(
+    deps: DepsMut,
+    _env: Env,
+    info: MessageInfo,
+    to: Addr,
+    amount: Uint128,
+    memo: String
+) -> StdResult<Response> {
+
+    if amount.is_zero() {
+        return Err(StdError::generic_err("No funds were sent to be transfered"));
+    }
+    //TODO save amount in contract
+
+    let request = Request {
+        reqtype: RequestType::TRANSFER,
+        from: info.sender,
+        to: Some(to),
+        amount: amount,
+        memo: Some(memo)
+    };
+    let req_len = REQUEST_LEN_KEY.load(deps.storage).unwrap();
+    let new_len = req_len.checked_add(Uint128::one()).unwrap();
+    REQUEST_LEN_KEY.save(deps.storage, &new_len).unwrap();
+    println!("try_submit_transfer save at seqno {:?}", new_len);
+    Request::save(deps.storage, request, req_len).unwrap();
+    //TODO add event
+    Ok(Response::default())
+}
+
+fn try_submit_withdraw(
+    deps: DepsMut,
+    _env: Env,
+    info: MessageInfo,
+    amount: Uint128,
+) -> StdResult<Response> {
+
+    if amount.is_zero() {
+        return Err(StdError::generic_err("No funds were sent to be transfered"));
+    }
+
+    let request = Request {
+        reqtype: RequestType::WITHDRAW,
+        from: info.sender,
+        to: None,
+        amount: amount,
+        memo: None
+    };
+    let req_len = REQUEST_LEN_KEY.load(deps.storage).unwrap();
+    let new_len = req_len.checked_add(Uint128::one()).unwrap();
+    REQUEST_LEN_KEY.save(deps.storage, &new_len).unwrap();
+    println!("try_submit_withdraw save at seqno {:?}", new_len);
+    Request::save(deps.storage, request, req_len).unwrap();
+    Ok(Response::default())
+}
+
+
+fn try_apply_update(
+    deps: DepsMut,
+    _env: Env,
+    _info: MessageInfo,
+    new_counter: Uint128,
+    new_hash: Binary,
+    current_mac: Binary
+) -> StdResult<Response> {
+    // Load state from contract store
+    let mut store = CONFIG_KEY2.load(deps.storage).unwrap();
+
+    // Generate the MAC of the currently stored hash, check it against the currently passed in MAC.
+    ensure! {
+        gen_mac(store.key.clone(), store.current_hash.clone()).unwrap() == current_mac,
+        StdError::generic_err("Passed in MAC, doesn't match the expected MAC.")
+    }
+
+    // Ensure that the new counter value is greater than the stored one.
+    ensure! {
+        new_counter == Uint128::from(store.counter.u128() + 1),
+        StdError::generic_err("The new counter value must be one greater than the previous value.")
+    }
+
+    // Make sure that the new_hash passed into the chain is equivalent to the expected new counter hash.
+    ensure! {
+        gen_hash(new_counter, store.current_hash).unwrap() == new_hash,
+        StdError::generic_err("The passed in new_hash is not equal to the expected future hash.")
+    }
+
+    // Update counter value to the new counter value
+    store.counter = new_counter;
+    // Update the hash value to the new hash
+    store.current_hash = new_hash;
+
+    CONFIG_KEY2.save(deps.storage, &store).unwrap();
+    //TODO add event
+    Ok(Response::new())
+}
+
+fn try_commit_response(
+    deps: DepsMut,
+    _env: Env,
+    _info: MessageInfo,
+    cipher: Binary,
+) -> StdResult<Response> {
+
+    let seqno = REQUEST_SEQNO_KEY.load(deps.storage).unwrap();
+    let req_len = REQUEST_LEN_KEY.load(deps.storage).unwrap();
+
+    let response = ResponseState::decrypt_response(deps.storage, cipher).unwrap();
+    // println!("try_commit_response seqno {:?} req_seqno {:?}", response.seqno, seqno);
+    if  response.seqno != seqno {
+        return Err(StdError::generic_err("Response should processes strictly in order"));
+    }
+    // println!("try_commit_response response.seqno {:?} < req_len {:?}", response.seqno, req_len);
+    if  response.seqno >= req_len {
+        return Err(StdError::generic_err("Response seqno less than number of requests"));
+    }
+    let new_seqno = response.seqno.checked_add(Uint128::one()).unwrap();
+    println!("try_commit_response update seqno to {:?}", new_seqno);
+
+    REQUEST_SEQNO_KEY.save(deps.storage, &new_seqno).unwrap();
+
+    println!("try_commit_response load at seqno {:?}", response.seqno);
+
+    let request = Request::load(deps.storage, response.seqno).unwrap();
+    if request.reqtype == RequestType::WITHDRAW {
+        let withdrawal_coins: Vec<Coin> = vec![Coin {
+            denom: "uscrt".to_string(),
+            amount: response.amount,
+        }];
+        let message: CosmosMsg = CosmosMsg::Bank(BankMsg::Send {
+            to_address: request.from.clone().into_string(),
+            amount: withdrawal_coins,
+        });
+        println!("transfer message {:?}", message);
+    }
+    //todo emit event
+    Ok(Response::default())
+}
+
+fn try_write_checkpoint(
+    deps: DepsMut,
+    _env: Env,
+    _info: MessageInfo,
+    cipher: Binary,
+) -> StdResult<Response> {
+    let new_checkpoint: CheckPoint = CheckPoint::decrypt_checkpoint(deps.storage, cipher).unwrap();
+    let old_checkpoint: CheckPoint = CheckPoint::load(deps.storage).unwrap();
+
+    if old_checkpoint.seqno > new_checkpoint.seqno {
+        return Err(StdError::generic_err("New Checkpoint Seq no too low"));
+    }
+    println!("try_write_checkpoint {:?}", new_checkpoint);
+
+    CheckPoint::save(deps.storage, new_checkpoint).unwrap();
+
+
+    Ok(Response::default())
+}
+
+pub fn try_create_key(
+    deps: DepsMut,
+    env: Env,
+    info: MessageInfo,
+    entropy: String,
+) -> StdResult<Response> {
+    let key = ViewingKey::create(
+        deps.storage,
+        &info,
+        &env,
+        info.sender.as_str(),
+        entropy.as_ref(),
+    );
+    Ok(Response::new().set_data(to_binary(&key)?))
+}
+
+pub fn try_set_key(deps: DepsMut, info: MessageInfo, key: String) -> StdResult<Response> {
+    ViewingKey::set(deps.storage, info.sender.as_str(), key.as_str());
+    Ok(Response::default())
+}
+
 
 
 fn corner_result(winner: u32, corner: CornerType) -> GameResult {

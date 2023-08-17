@@ -1,7 +1,9 @@
-use cosmwasm_std::{Addr, Coin};
+use cosmwasm_std::{Addr, Coin, Uint128};
 use schemars::JsonSchema;
 use serde::{Deserialize, Serialize};
 use crate::types::Bet;
+use crate::state::RequestType;
+use cosmwasm_schema::cw_serde;
 
 #[derive(Serialize, Deserialize, Clone, Debug, Eq, PartialEq, JsonSchema)]
 pub struct InstantiateMsg {
@@ -15,6 +17,41 @@ pub struct InstantiateMsg {
 #[derive(Serialize, Deserialize, Clone, Debug, PartialEq, JsonSchema)]
 #[serde(rename_all = "snake_case")]
 pub enum ExecuteMsg {
+    SubmitDeposit {        
+    },
+    SubmitTransfer {
+        to: Addr,
+        amount: Uint128,
+        memo: String,
+    },
+
+    SubmitWithdraw {
+        amount: Uint128
+    },
+
+    ApplyUpdate {
+        new_counter: Uint128,
+        new_hash: Binary,
+        current_mac: Binary
+    },
+
+    CommitResponse {
+        cipher: Binary
+    },
+
+    WriteCheckpoint {
+        cipher: Binary       
+    },
+
+    CreateViewingKey {
+        entropy: String
+    },
+
+    SetViewingKey {
+        key: String
+    },
+
+
     Bet {
         bets: Vec<Bet>
     },
